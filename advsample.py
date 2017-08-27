@@ -1,23 +1,24 @@
+import json
+import os
+import tarfile
+import tempfile
+from urllib.request import urlretrieve
+
+import PIL
+import matplotlib.pyplot as plt
+import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
 import tensorflow.contrib.slim.nets as nets
 
-import tempfile
-from urllib.request import urlretrieve
-import tarfile
-import os
+DIM = 299
+GRAYSCALE = 255
+ORIGINAL_CLASS = 281 # "cat"
+TARGET_CLASS = 924 # "guacamole"
+MAX_PIXEL_OFF = 3 # 3 pixel off allowed
 
-import json
-import matplotlib.pyplot as plt
-import PIL
-import numpy as np
-
-# model download
-data_dir = tempfile.mkdtemp()
-inception_tarball, _ = urlretrieve(
-    'http://download.tensorflow.org/models/inception_v3_2016_08_28.tar.gz')
-tarfile.open(inception_tarball, 'r:gz').extractall(data_dir)
-
+# TF Inception graph wiring, main purpose is to expose the logits output
+# note slim only provides the graph, data file will be downloaded next
 def inception(image, reuse):
     preprocessed = tf.multiply(tf.subtract(tf.expand_dims(image, 0), 0.5), 2.0)
     arg_scope = nets.inception.inception_v3_arg_scope(weight_decay=0.0)
@@ -28,12 +29,17 @@ def inception(image, reuse):
         probs = tf.nn.softmax(logits)  # probabilities
     return logits, probs
 
-# TF set up & restore
 tf.logging.set_verbosity(tf.logging.ERROR)
 sess = tf.InteractiveSession()
-image = tf.Variable(tf.zeros((299, 299, 3)))
-
+image = tf.Variable(tf.zeros((DIM, DIM, 3)))
 logits, probs = inception(image, reuse=False)
+
+# inception 3 model download to temp location and restore
+data_dir = tempfile.mkdtemp()
+print("temp dir = " + data_dir + "\n")
+inception_tarball, _headers = urlretrieve(
+    'http://download.tensorflow.org/models/inception_v3_2016_08_28.tar.gz')
+tarfile.open(inception_tarball, 'r:gz').extractall(data_dir)
 
 restore_vars = [
     var for var in tf.global_variables()
@@ -42,43 +48,117 @@ restore_vars = [
 saver = tf.train.Saver(restore_vars)
 saver.restore(sess, os.path.join(data_dir, 'inception_v3.ckpt'))
 
-# test
-imagenet_json, _ = urlretrieve(
+# loading labels
+imagenet_json, _headers = urlretrieve(
     'http://www.anishathalye.com/media/2017/07/25/imagenet.json')
 with open(imagenet_json) as f:
     imagenet_labels = json.load(f)
+print( "size of imagenet label = %d" % ( len( imagenet_labels ) )  )
 
+# main helper to show graph
+def classify(title, img, correct_class=None, target_class=None ):
 
-def classify(img, correct_class=None, target_class=None):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 8))
     fig.sca(ax1)
-    p = sess.run(probs, feed_dict={image: img})[0]
+    p = sess.run(probs, feed_dict={image: img})[0] # model output
     ax1.imshow(img)
     fig.sca(ax1)
 
-    topk = list(p.argsort()[-10:][::-1])
-    topprobs = p[topk]
-    barlist = ax2.bar(range(10), topprobs)
-    if target_class in topk:
-        barlist[topk.index(target_class)].set_color('r')
-    if correct_class in topk:
-        barlist[topk.index(correct_class)].set_color('g')
+    top_k = list(p.argsort()[-10:][::-1])
+    top_probs = p[top_k]
+    barlist = ax2.bar(range(10), top_probs)
+    if target_class in top_k:
+        barlist[top_k.index(target_class)].set_color('r')
+    if correct_class in top_k:
+        barlist[top_k.index(correct_class)].set_color('g')
+
     plt.sca(ax2)
     plt.ylim([0, 1.1])
     plt.xticks(range(10),
-               [imagenet_labels[i][:15] for i in topk],
+               [imagenet_labels[i][:15] for i in top_k],
                rotation='vertical')
     fig.subplots_adjust(bottom=0.2)
+    plt.title(title)
     plt.show()
 
+def textClassify( img, k = 5 ):
+    p = sess.run(probs, feed_dict={image: img})[0]  # model output
+    top_k = list(p.argsort()[-k:][::-1])
+    top_probs = p[top_k]
 
-img_path, _ = urlretrieve('http://www.anishathalye.com/media/2017/07/25/cat.jpg')
-img_class = 281
+    np.set_printoptions(precision=4)
+    print (top_k, "\n")
+    print( top_probs, "\n" )
+
+# quick test with resizing
+img_path, _headers = urlretrieve('http://www.anishathalye.com/media/2017/07/25/cat.jpg')
+img_class = ORIGINAL_CLASS # 281 is cat
 img = PIL.Image.open(img_path)
+
+print( 'raw image size = w %d, h %d' % ( img.width, img.height ) )
 big_dim = max(img.width, img.height)
 wide = img.width > img.height
-new_w = 299 if not wide else int(img.width * 299 / img.height)
-new_h = 299 if wide else int(img.height * 299 / img.width)
-img = img.resize((new_w, new_h)).crop((0, 0, 299, 299))
-img = (np.asarray(img) / 255.0).astype(np.float32)
-classify(img, correct_class=img_class)
+new_w = DIM if not wide else int(img.width * DIM / img.height)
+new_h = DIM if wide else int(img.height * DIM / img.width)
+img = img.resize((new_w, new_h)).crop((0, 0, DIM, DIM))
+img = (np.asarray(img) / GRAYSCALE).astype(np.float32)
+# classify( "original", img, correct_class = img_class )
+textClassify( img )
+
+# ----------- adversarial part
+x = tf.placeholder(tf.float32, (DIM, DIM, 3))
+
+x_hat = image  # our trainable adversarial input
+assign_op = tf.assign(x_hat, x)
+learning_rate = tf.placeholder(tf.float32, ())
+y_hat = tf.placeholder(tf.int32, ()) # class name
+labels = tf.one_hot(y_hat, 1000)
+
+# objective is to train to y_hat
+loss = tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=[labels])
+optim_step = tf.train.GradientDescentOptimizer(
+    learning_rate).minimize(loss, var_list=[x_hat])
+
+# noise bound
+epsilon = tf.placeholder(tf.float32, ())
+below = x - epsilon
+above = x + epsilon
+
+# clipped perturbation
+projected = tf.clip_by_value(tf.clip_by_value(x_hat, below, above), 0, 1)
+with tf.control_dependencies([projected]):
+    project_step = tf.assign(x_hat, projected)
+
+demo_epsilon = MAX_PIXEL_OFF / GRAYSCALE
+demo_lr = 5e-2
+demo_steps = 300
+print_stepsize = 10
+demo_target = TARGET_CLASS
+
+# initialization step
+
+sess.run(assign_op, feed_dict={x: img})
+
+# projected gradient descent
+for i in range(demo_steps):
+    # gradient descent step
+    _, loss_value = sess.run(
+        [optim_step, loss],
+        feed_dict={learning_rate: demo_lr, y_hat: demo_target})
+    # project step
+    sess.run(project_step, feed_dict={x: img, epsilon: demo_epsilon})
+    if (i + 1) % print_stepsize == 0:
+        print('step %d, loss=%.6f' % (i + 1, loss_value))
+
+adv = x_hat.eval()  # retrieve the adversarial example
+#classify("grad attack", adv, correct_class=img_class, target_class=demo_target)
+textClassify( img )
+
+# check if the above attack works for rotation
+ex_angle = np.pi/8
+angle = tf.placeholder(tf.float32, ())
+rotated_image = tf.contrib.image.rotate(image, angle)
+rotated_example = rotated_image.eval(feed_dict={image: adv, angle: ex_angle}) # note input is adv
+classify(rotated_example, correct_class=img_class, target_class=demo_target)
+
+# what is the sensitivity
